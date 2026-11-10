@@ -102,6 +102,23 @@ pub struct Completion {
     pub missing_options_for: Option<String>,
 }
 
+/// Length of a leading `git` word plus the whitespace after it; 0 when absent.
+pub fn git_prefix_len(line: &str) -> usize {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix("git") else {
+        return 0;
+    };
+    if !rest.starts_with(char::is_whitespace) {
+        return 0;
+    }
+    line.len() - rest.trim_start().len()
+}
+
+/// The line without a leading `git` word.
+pub fn strip_git_prefix(line: &str) -> &str {
+    &line[git_prefix_len(line)..]
+}
+
 /// Split the text before the cursor into finished words and the partial word.
 fn split_words(before_cursor: &str) -> (Vec<&str>, usize, &str) {
     let word_start = before_cursor
@@ -114,6 +131,13 @@ fn split_words(before_cursor: &str) -> (Vec<&str>, usize, &str) {
 
 /// Compute completion candidates for the word ending at `cursor` (byte offset).
 pub fn complete(line: &str, cursor: usize, vocab: &Vocabulary, values: &RepoValues) -> Completion {
+    // A typed leading `git` is ignored (the label already says git).
+    let skip = git_prefix_len(line);
+    if skip > 0 && cursor >= skip {
+        let mut c = complete(&line[skip..], cursor - skip, vocab, values);
+        c.word_start += skip;
+        return c;
+    }
     let before = &line[..cursor.min(line.len())];
     let (words, word_start, partial) = split_words(before);
     let mut missing_options_for = None;
@@ -407,6 +431,27 @@ mod tests {
         let c = complete(line, 6, &vocab(), &values);
         assert_eq!(c.word_start, 5);
         assert_eq!(texts(&c), vec!["origin"]);
+    }
+
+    #[test]
+    fn leading_git_is_ignored() {
+        assert_eq!(strip_git_prefix("git pull --rebase"), "pull --rebase");
+        assert_eq!(strip_git_prefix("  git   status"), "status");
+        assert_eq!(strip_git_prefix("gitk"), "gitk");
+        assert_eq!(strip_git_prefix("git"), "git");
+        assert_eq!(strip_git_prefix("pull"), "pull");
+        assert_eq!(strip_git_prefix("log --grep git"), "log --grep git");
+
+        let c = at_end("git pu", &RepoValues::default());
+        assert_eq!(texts(&c), vec!["pull", "push"]);
+        assert_eq!(c.word_start, 4);
+        let c = at_end("git pull --r", &RepoValues::default());
+        assert_eq!(texts(&c), vec!["--rebase"]);
+        assert_eq!(c.word_start, 9);
+        assert_eq!(
+            replace_word("git pull --r", c.word_start, 12, "--rebase "),
+            ("git pull --rebase ".into(), 18)
+        );
     }
 
     #[test]

@@ -45,8 +45,8 @@ greyed out, and comes back by itself when the folder returns.
   progress) or behind (unpulled commits). The toolbar repeats the card buttons
   for all marked repositories.
 - **Command line** at the bottom: type git arguments after the fixed `git`
-  label; Enter runs them in all marked repositories. It is disabled while
-  nothing is marked.
+  label (typing `git` first anyway is fine; it is ignored); Enter runs them in
+  all marked repositories. It is disabled while nothing is marked.
 
 Commands run in parallel, four at a time by default. Destructive commands
 (`reset --hard`, `push --force`, `clean -f`, `branch -D`, `checkout -- <paths>`,

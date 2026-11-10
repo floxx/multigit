@@ -262,7 +262,7 @@ impl CliState {
         }
 
         let hint = if cx.enabled {
-            "git arguments (Tab completes, Ctrl+R searches history)"
+            "git arguments, a leading git is ignored (Tab completes, Ctrl+R searches history)"
         } else {
             "mark repositories to run commands"
         };

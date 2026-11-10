@@ -2,7 +2,7 @@
 
 use crate::application::engine::{Backend, Engine, Event, Notify};
 use crate::application::schedule::{Due, Schedule};
-use crate::domain::completion::{RepoValues, Vocabulary};
+use crate::domain::completion::{RepoValues, Vocabulary, strip_git_prefix};
 use crate::domain::config::Config;
 use crate::domain::destructive::is_destructive;
 use crate::domain::history::History;
@@ -266,7 +266,8 @@ impl App {
     /// Run `git <command>` in `repos`; destructive commands on more than one repo
     /// wait for confirmation.
     pub fn start_run(&mut self, command: &str, repos: Vec<PathBuf>) {
-        if repos.is_empty() {
+        let command = strip_git_prefix(command.trim());
+        if repos.is_empty() || command.is_empty() {
             return;
         }
         let args = match shell_words::split(command) {
@@ -308,7 +309,8 @@ impl App {
     /// Enter in the CLI: record history, run in all marked repos.
     pub fn run_cli_line(&mut self, line: &str) {
         let repos = self.marked_repos();
-        if line.trim().is_empty() || repos.is_empty() {
+        let line = strip_git_prefix(line.trim());
+        if line.is_empty() || repos.is_empty() {
             return;
         }
         self.history.push(line);
@@ -708,6 +710,25 @@ pub(crate) mod tests {
         assert!(
             matches!(&run.sections[0].state, SectionState::Done(o) if o.stdout == "ran log --format=%h %s")
         );
+    }
+
+    #[test]
+    fn typed_git_prefix_is_dropped_from_run_and_history() {
+        let backend = Arc::new(FakeBackend::default());
+        let mut app = app_with(backend.clone(), None);
+        app.cards = vec![Card::new("/a".into())];
+        app.marked.insert("/a".into());
+        app.run_cli_line("git pull --rebase");
+        settle(&mut app, |a| a.cards[0].last_command == Some(true));
+        assert_eq!(
+            backend.runs.lock().unwrap().clone(),
+            vec![(
+                PathBuf::from("/a"),
+                vec!["pull".to_owned(), "--rebase".to_owned()]
+            )]
+        );
+        assert_eq!(app.history.entries(), &["pull --rebase"]);
+        assert_eq!(app.log.runs().next().unwrap().command, "pull --rebase");
     }
 
     #[test]

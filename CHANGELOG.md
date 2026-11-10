@@ -13,7 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - (+) adds a repository, or every repository up to two folder levels below a chosen folder; × and "Remove marked" take cards off the board without touching files.
 - Card buttons, by default `pull --ff-only`, `pull --rebase`, `push` and `fetch --all --prune`, editable in Settings with presets.
 - Marking cards (individually, or all / none / dirty / behind) and running toolbar buttons on all marked repositories.
-- Command line for any git command on the marked repositories, with Tab completion of subcommands, options, branches, remotes, tags and files, and a clickable suggestion popup.
+- Command line for any git command on the marked repositories (a typed leading `git` is ignored), with Tab completion of subcommands, options, branches, remotes, tags and files, and a clickable suggestion popup.
 - Command history with inline suggestions, filtered Up/Down and Ctrl+R fuzzy search, kept across restarts.
 - Output panel with one section per repository and exit code for the last 50 commands.
 - Confirmation before destructive commands (such as `reset --hard` or `push --force`) run in more than one repository.
