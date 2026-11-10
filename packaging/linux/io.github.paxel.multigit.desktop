@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=multigit
+Comment=Dashboard for many git repositories
+Exec=multigit
+Icon=multigit
+Terminal=false
+Categories=Development;RevisionControl;
+StartupWMClass=io.github.paxel.multigit
+X-Multigit-Managed=true

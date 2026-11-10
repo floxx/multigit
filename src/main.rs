@@ -1,8 +1,9 @@
 //! multigit binary: loads config and history, starts the window.
 
 use multigit::infrastructure::backend::GitBackend;
+use multigit::infrastructure::launcher::{self, APP_ID, ICON_PNG};
 use multigit::infrastructure::store::{self, Paths};
-use multigit::ui::{MultigitApp, app::App};
+use multigit::ui::{MultigitApp, app::App, style};
 use std::sync::Arc;
 
 fn main() -> eframe::Result {
@@ -20,17 +21,25 @@ fn main() -> eframe::Result {
         .map(|p| store::load_history(&p.history_file))
         .unwrap_or_default();
 
+    launcher::register_in_background();
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("multigit")
+        .with_app_id(APP_ID)
+        .with_inner_size([1200.0, 800.0]);
+    match eframe::icon_data::from_png_bytes(ICON_PNG) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(e) => tracing::warn!("cannot load window icon: {e}"),
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("multigit")
-            .with_app_id("multigit")
-            .with_inner_size([1200.0, 800.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
         "multigit",
         options,
         Box::new(move |cc| {
+            style::apply(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             let notify = Arc::new(move || ctx.request_repaint());
             let backend = Arc::new(GitBackend::default());

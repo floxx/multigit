@@ -13,8 +13,10 @@ use std::path::PathBuf;
 const CARD_WIDTH: f32 = 290.0;
 /// Inner margin of a card frame.
 const CARD_MARGIN: f32 = 8.0;
-/// Width a card takes on the board: content, margins and frame stroke.
-const CARD_OUTER_WIDTH: f32 = CARD_WIDTH + 2.0 * CARD_MARGIN + 2.0;
+/// Border width of a marked card.
+const MARKED_STROKE: f32 = 3.0;
+/// Width a card takes on the board: content, margins and the widest frame stroke.
+const CARD_OUTER_WIDTH: f32 = CARD_WIDTH + 2.0 * CARD_MARGIN + 2.0 * MARKED_STROKE;
 
 /// Something the user clicked that changes the board; applied after drawing.
 enum BoardAction {
@@ -284,69 +286,75 @@ fn card_ui(
     actions: &mut Vec<BoardAction>,
 ) {
     let path_text = card.path.display().to_string();
-    egui::Frame::group(ui.style())
-        .inner_margin(CARD_MARGIN)
-        .show(ui, |ui| {
-            ui.set_width(CARD_WIDTH);
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    let mut checked = marked;
+    let mut frame = egui::Frame::group(ui.style()).inner_margin(CARD_MARGIN);
+    if marked {
+        // Marked cards get a thick selection-colored border and a tinted background.
+        let selection = ui.visuals().selection.bg_fill;
+        frame = frame
+            .stroke(egui::Stroke::new(MARKED_STROKE, selection))
+            .fill(selection.gamma_multiply(0.18));
+    }
+    frame.show(ui, |ui| {
+        ui.set_width(CARD_WIDTH);
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                let mut checked = marked;
+                if ui
+                    .checkbox(&mut checked, "")
+                    .on_hover_text("Mark")
+                    .changed()
+                {
+                    actions.push(BoardAction::Toggle(card.path.clone()));
+                }
+                ui.label(RichText::new(title(&card.path)).strong().size(15.0))
+                    .on_hover_text(&path_text);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .checkbox(&mut checked, "")
-                        .on_hover_text("Mark")
-                        .changed()
+                        .small_button("×")
+                        .on_hover_text("Remove from board (files stay)")
+                        .clicked()
                     {
-                        actions.push(BoardAction::Toggle(card.path.clone()));
-                    }
-                    ui.label(RichText::new(title(&card.path)).strong().size(15.0))
-                        .on_hover_text(&path_text);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .small_button("×")
-                            .on_hover_text("Remove from board (files stay)")
-                            .clicked()
-                        {
-                            actions.push(BoardAction::Remove(card.path.clone()));
-                        }
-                    });
-                });
-                if let Some(sub) = subtitle {
-                    ui.weak(sub).on_hover_text(&path_text);
-                }
-                let greyed = card.snapshot().is_none();
-                if greyed {
-                    ui.multiply_opacity(0.55);
-                }
-                status_lines(ui, card);
-                if let Some(error) = &card.fetch_error {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("fetch: {error}"));
-                }
-                if busy {
-                    ui.colored_label(ui.visuals().warn_fg_color, "running");
-                } else {
-                    match card.last_command {
-                        Some(true) => {
-                            ui.colored_label(ok_color(ui), "last command: ok");
-                        }
-                        Some(false) => {
-                            ui.colored_label(ui.visuals().error_fg_color, "last command: failed");
-                        }
-                        None => {}
-                    }
-                }
-                ui.horizontal_wrapped(|ui| {
-                    for (i, b) in buttons.iter().enumerate() {
-                        if ui
-                            .add_enabled(!greyed, egui::Button::new(&b.label).small())
-                            .on_hover_text(format!("git {}", b.args))
-                            .clicked()
-                        {
-                            actions.push(BoardAction::Button(i, card.path.clone()));
-                        }
+                        actions.push(BoardAction::Remove(card.path.clone()));
                     }
                 });
             });
+            if let Some(sub) = subtitle {
+                ui.weak(sub).on_hover_text(&path_text);
+            }
+            let greyed = card.snapshot().is_none();
+            if greyed {
+                ui.multiply_opacity(0.55);
+            }
+            status_lines(ui, card);
+            if let Some(error) = &card.fetch_error {
+                ui.colored_label(ui.visuals().error_fg_color, format!("fetch: {error}"));
+            }
+            if busy {
+                ui.colored_label(ui.visuals().warn_fg_color, "running");
+            } else {
+                match card.last_command {
+                    Some(true) => {
+                        ui.colored_label(ok_color(ui), "last command: ok");
+                    }
+                    Some(false) => {
+                        ui.colored_label(ui.visuals().error_fg_color, "last command: failed");
+                    }
+                    None => {}
+                }
+            }
+            ui.horizontal_wrapped(|ui| {
+                for (i, b) in buttons.iter().enumerate() {
+                    if ui
+                        .add_enabled(!greyed, egui::Button::new(&b.label))
+                        .on_hover_text(format!("git {}", b.args))
+                        .clicked()
+                    {
+                        actions.push(BoardAction::Button(i, card.path.clone()));
+                    }
+                }
+            });
         });
+    });
 }
 
 fn status_lines(ui: &mut Ui, card: &Card) {

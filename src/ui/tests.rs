@@ -13,9 +13,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn harness(app: App) -> Harness<'static, App> {
-    Harness::builder()
+    let h = Harness::builder()
         .with_size(egui::vec2(1200.0, 800.0))
-        .build_ui_state(|ui, app: &mut App| app.show(ui), app)
+        .build_ui_state(|ui, app: &mut App| app.show(ui), app);
+    crate::ui::style::apply(&h.ctx);
+    h
 }
 
 /// App with one marked card whose snapshot has the given branches.
@@ -281,7 +283,8 @@ fn settings_button_editor() {
     assert_eq!(args(&h).len(), 4);
     h.get_by_value("Add preset").click();
     h.run();
-    h.get_by_label("stash pop  (git stash pop)").click();
+    h.get_by_label("stash pop  (git stash pop)")
+        .click_accesskit();
     h.run();
     assert_eq!(args(&h).last().map(String::as_str), Some("stash pop"));
 }
@@ -297,4 +300,17 @@ fn glyphs_used_in_labels_exist_in_default_fonts() {
             "missing glyph {c}"
         );
     }
+}
+
+#[test]
+fn buttons_have_room_around_their_text() {
+    let mut h = harness(app_with(Arc::default(), None));
+    h.run();
+    let rect = h.get_by_label("Settings").rect();
+    let text_height = h.ctx.global_style().text_styles[&egui::TextStyle::Button].size;
+    assert!(
+        rect.height() >= text_height + 2.0 * crate::ui::style::BUTTON_PADDING.y,
+        "button {rect:?} too tight"
+    );
+    assert!(rect.height() >= 28.0);
 }

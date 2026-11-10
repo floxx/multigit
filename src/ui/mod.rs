@@ -3,6 +3,7 @@
 pub mod app;
 pub mod cli;
 pub mod settings;
+pub mod style;
 pub mod view;
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod git;
+pub mod launcher;
 pub mod probe;
 pub mod scan;
 pub mod store;
