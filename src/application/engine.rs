@@ -1,0 +1,468 @@
+//! Background execution: polls, fetches and user commands on worker threads.
+//!
+//! Rules:
+//! - Polls and fetches share one concurrency budget, user commands another, so
+//!   background work never starves commands.
+//! - One process per repository at a time: a command waits for a running
+//!   poll/fetch of its repo; polls/fetches are skipped while a command for the
+//!   repo is queued or running, and while another poll/fetch is still busy.
+//! - After a command, the repository is probed again right away.
+
+use crate::application::semaphore::Semaphore;
+use crate::domain::output::{ProcessOutput, SectionState};
+use crate::domain::repo::{ProbeError, Snapshot, summarize_fetch_error};
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::thread;
+
+/// Arguments of the automatic background fetch.
+pub const FETCH_ARGS: &[&str] = &["fetch", "--all", "--prune"];
+
+/// The git operations the engine needs (port; implemented over the system git).
+pub trait Backend: Send + Sync + 'static {
+    fn probe(&self, dir: &Path) -> Result<Snapshot, ProbeError>;
+    fn run(&self, dir: &Path, args: &[String]) -> io::Result<ProcessOutput>;
+    /// All subcommand names (incl. aliases) and the names of builtins.
+    fn list_commands(&self, dir: &Path) -> (Vec<String>, Vec<String>);
+    /// Options git reports for a builtin via `--git-completion-helper`.
+    fn options(&self, dir: &Path, command: &str) -> Vec<String>;
+}
+
+/// Messages from worker threads to the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    Probed {
+        repo: PathBuf,
+        result: Result<Snapshot, ProbeError>,
+    },
+    /// A background fetch finished; `error` is the card text on failure.
+    Fetched {
+        repo: PathBuf,
+        error: Option<String>,
+    },
+    Section {
+        run: u64,
+        repo: PathBuf,
+        state: SectionState,
+    },
+    Commands {
+        all: Vec<String>,
+        builtins: Vec<String>,
+    },
+    Options {
+        command: String,
+        options: Vec<String>,
+    },
+}
+
+/// Called after every event so the UI can repaint.
+pub type Notify = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct Slot {
+    lock: Mutex<()>,
+    pending_commands: AtomicUsize,
+    background_busy: AtomicBool,
+}
+
+impl Slot {
+    fn lock(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn try_lock(&self) -> Option<MutexGuard<'_, ()>> {
+        match self.lock.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
+    fn commands_pending(&self) -> bool {
+        self.pending_commands.load(Ordering::SeqCst) > 0
+    }
+}
+
+#[derive(Clone)]
+struct Shared {
+    backend: Arc<dyn Backend>,
+    tx: Sender<Event>,
+    notify: Notify,
+}
+
+impl Shared {
+    fn send(&self, event: Event) {
+        // The receiver only disappears when the app shuts down.
+        let _ = self.tx.send(event);
+        (self.notify)();
+    }
+}
+
+/// Owns the worker budgets and per-repository slots; lives on the UI thread.
+pub struct Engine {
+    shared: Shared,
+    commands: Arc<Semaphore>,
+    background: Arc<Semaphore>,
+    slots: HashMap<PathBuf, Arc<Slot>>,
+}
+
+impl Engine {
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        concurrency: usize,
+        notify: Notify,
+    ) -> (Self, Receiver<Event>) {
+        let (tx, rx) = channel();
+        let engine = Self {
+            shared: Shared {
+                backend,
+                tx,
+                notify,
+            },
+            commands: Arc::new(Semaphore::new(concurrency)),
+            background: Arc::new(Semaphore::new(concurrency)),
+            slots: HashMap::new(),
+        };
+        (engine, rx)
+    }
+
+    /// Change both budgets; running jobs keep their permits.
+    pub fn set_concurrency(&self, concurrency: usize) {
+        self.commands.set_max(concurrency);
+        self.background.set_max(concurrency);
+    }
+
+    fn slot(&mut self, repo: &Path) -> Arc<Slot> {
+        self.slots.entry(repo.to_path_buf()).or_default().clone()
+    }
+
+    /// Whether a command for `repo` is queued or running.
+    pub fn is_busy(&self, repo: &Path) -> bool {
+        self.slots.get(repo).is_some_and(|s| s.commands_pending())
+    }
+
+    /// Probe `repo` in the background. Returns `false` when skipped.
+    pub fn poll(&mut self, repo: &Path) -> bool {
+        self.spawn_background(repo, false)
+    }
+
+    /// Fetch, then probe `repo` in the background. Returns `false` when skipped.
+    pub fn fetch(&mut self, repo: &Path) -> bool {
+        self.spawn_background(repo, true)
+    }
+
+    fn spawn_background(&mut self, repo: &Path, fetch: bool) -> bool {
+        let slot = self.slot(repo);
+        if slot.commands_pending() || slot.background_busy.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let shared = self.shared.clone();
+        let budget = self.background.clone();
+        let repo = repo.to_path_buf();
+        thread::spawn(move || {
+            {
+                let _permit = budget.acquire();
+                // A command may have been queued while this job waited for a permit.
+                let guard = (!slot.commands_pending())
+                    .then(|| slot.try_lock())
+                    .flatten();
+                if guard.is_some() {
+                    if fetch {
+                        let args: Vec<String> = FETCH_ARGS.iter().map(|s| s.to_string()).collect();
+                        let error = match shared.backend.run(&repo, &args) {
+                            Ok(out) if out.success() => None,
+                            Ok(out) => Some(summarize_fetch_error(&out.stderr)),
+                            Err(e) => Some(e.to_string()),
+                        };
+                        shared.send(Event::Fetched {
+                            repo: repo.clone(),
+                            error,
+                        });
+                    }
+                    let result = shared.backend.probe(&repo);
+                    shared.send(Event::Probed {
+                        repo: repo.clone(),
+                        result,
+                    });
+                }
+            }
+            slot.background_busy.store(false, Ordering::SeqCst);
+        });
+        true
+    }
+
+    /// Run `git <args>` in `repo` as part of output run `run`.
+    pub fn run_command(&mut self, run: u64, repo: &Path, args: Vec<String>) {
+        let slot = self.slot(repo);
+        slot.pending_commands.fetch_add(1, Ordering::SeqCst);
+        let shared = self.shared.clone();
+        let budget = self.commands.clone();
+        let repo = repo.to_path_buf();
+        thread::spawn(move || {
+            {
+                // Repo lock first: waiting for it must not hold a command permit.
+                let _guard = slot.lock();
+                let _permit = budget.acquire();
+                shared.send(Event::Section {
+                    run,
+                    repo: repo.clone(),
+                    state: SectionState::Running,
+                });
+                let state = match shared.backend.run(&repo, &args) {
+                    Ok(out) => SectionState::Done(out),
+                    Err(e) => SectionState::SpawnFailed(e.to_string()),
+                };
+                shared.send(Event::Section {
+                    run,
+                    repo: repo.clone(),
+                    state,
+                });
+                let result = shared.backend.probe(&repo);
+                shared.send(Event::Probed {
+                    repo: repo.clone(),
+                    result,
+                });
+            }
+            slot.pending_commands.fetch_sub(1, Ordering::SeqCst);
+            (shared.notify)();
+        });
+    }
+
+    /// Load subcommand names in the background (sends [`Event::Commands`]).
+    pub fn load_commands(&self, dir: PathBuf) {
+        let shared = self.shared.clone();
+        thread::spawn(move || {
+            let (all, builtins) = shared.backend.list_commands(&dir);
+            shared.send(Event::Commands { all, builtins });
+        });
+    }
+
+    /// Load git's option list for `command` (sends [`Event::Options`]).
+    pub fn load_options(&self, dir: PathBuf, command: String) {
+        let shared = self.shared.clone();
+        thread::spawn(move || {
+            let options = shared.backend.options(&dir, &command);
+            shared.send(Event::Options { command, options });
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::completion::RepoRefs;
+    use crate::domain::status::{Counts, Head, RepoState, Status, Upstream};
+    use std::sync::Condvar;
+    use std::time::Duration;
+
+    /// Fake backend: records calls; `run` blocks while the gate is closed.
+    #[derive(Default)]
+    struct Fake {
+        calls: Mutex<Vec<String>>,
+        gate: Mutex<bool>,
+        cv: Condvar,
+        fail_fetch: bool,
+    }
+
+    impl Fake {
+        fn open(&self) {
+            *self.gate.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            status: Status {
+                head: Head::Branch("main".into()),
+                upstream: Upstream::None,
+                counts: Counts::default(),
+                changed_paths: vec![],
+            },
+            state: RepoState::Normal,
+            refs: RepoRefs::default(),
+        }
+    }
+
+    impl Backend for Fake {
+        fn probe(&self, dir: &Path) -> Result<Snapshot, ProbeError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("probe {}", dir.display()));
+            Ok(snapshot())
+        }
+        fn run(&self, dir: &Path, args: &[String]) -> io::Result<ProcessOutput> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("run {} {}", dir.display(), args.join(" ")));
+            let mut open = self.gate.lock().unwrap();
+            while !*open {
+                open = self.cv.wait(open).unwrap();
+            }
+            let failed = self.fail_fetch && args.first().is_some_and(|a| a == "fetch");
+            Ok(ProcessOutput {
+                exit_code: Some(if failed { 128 } else { 0 }),
+                stdout: "ok".into(),
+                stderr: if failed {
+                    "Permission denied (publickey).".into()
+                } else {
+                    String::new()
+                },
+            })
+        }
+        fn list_commands(&self, _dir: &Path) -> (Vec<String>, Vec<String>) {
+            (vec!["pull".into()], vec!["pull".into()])
+        }
+        fn options(&self, _dir: &Path, command: &str) -> Vec<String> {
+            vec![format!("--{command}-opt")]
+        }
+    }
+
+    fn engine(fake: Arc<Fake>) -> (Engine, Receiver<Event>) {
+        Engine::new(fake, 2, Arc::new(|| {}))
+    }
+
+    fn recv(rx: &Receiver<Event>) -> Event {
+        rx.recv_timeout(Duration::from_secs(5)).expect("event")
+    }
+
+    #[test]
+    fn poll_sends_snapshot() {
+        let fake = Arc::new(Fake::default());
+        let (mut engine, rx) = engine(fake.clone());
+        assert!(engine.poll(Path::new("/r")));
+        assert_eq!(
+            recv(&rx),
+            Event::Probed {
+                repo: "/r".into(),
+                result: Ok(snapshot())
+            }
+        );
+    }
+
+    #[test]
+    fn command_runs_then_reprobes_and_blocks_polls() {
+        let fake = Arc::new(Fake::default());
+        let (mut engine, rx) = engine(fake.clone());
+        let repo = Path::new("/r");
+        engine.run_command(7, repo, vec!["push".into()]);
+        assert!(engine.is_busy(repo));
+        assert_eq!(
+            recv(&rx),
+            Event::Section {
+                run: 7,
+                repo: repo.into(),
+                state: SectionState::Running
+            }
+        );
+        // While the command runs, background work for this repo is skipped.
+        assert!(!engine.poll(repo));
+        assert!(!engine.fetch(repo));
+        fake.open();
+        match recv(&rx) {
+            Event::Section {
+                state: SectionState::Done(out),
+                ..
+            } => assert!(out.success()),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(recv(&rx), Event::Probed { .. }));
+        assert_eq!(fake.calls(), vec!["run /r push", "probe /r"]);
+    }
+
+    #[test]
+    fn command_waits_for_running_fetch() {
+        let fake = Arc::new(Fake::default());
+        let (mut engine, rx) = engine(fake.clone());
+        let repo = Path::new("/r");
+        assert!(engine.fetch(repo));
+        // Give the fetch time to take the repo lock and block in `run`.
+        while fake.calls().is_empty() {
+            thread::sleep(Duration::from_millis(5));
+        }
+        engine.run_command(1, repo, vec!["pull".into()]);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(fake.calls(), vec!["run /r fetch --all --prune"]);
+        fake.open();
+        let mut events = Vec::new();
+        while events.len() < 5 {
+            events.push(recv(&rx));
+        }
+        assert_eq!(
+            fake.calls(),
+            vec![
+                "run /r fetch --all --prune",
+                "probe /r",
+                "run /r pull",
+                "probe /r"
+            ]
+        );
+    }
+
+    #[test]
+    fn second_poll_skipped_while_first_busy() {
+        let fake = Arc::new(Fake::default());
+        let (mut engine, rx) = engine(fake.clone());
+        assert!(engine.fetch(Path::new("/r")));
+        assert!(!engine.poll(Path::new("/r")));
+        assert!(engine.poll(Path::new("/other")));
+        fake.open();
+        let mut events = Vec::new();
+        while events.len() < 3 {
+            events.push(recv(&rx));
+        }
+        assert!(events.contains(&Event::Fetched {
+            repo: "/r".into(),
+            error: None
+        }));
+    }
+
+    #[test]
+    fn failed_fetch_reports_auth() {
+        let fake = Arc::new(Fake {
+            fail_fetch: true,
+            ..Fake::default()
+        });
+        fake.open();
+        let (mut engine, rx) = engine(fake.clone());
+        engine.fetch(Path::new("/r"));
+        assert_eq!(
+            recv(&rx),
+            Event::Fetched {
+                repo: "/r".into(),
+                error: Some("auth failed".into())
+            }
+        );
+    }
+
+    #[test]
+    fn vocabulary_loading() {
+        let fake = Arc::new(Fake::default());
+        let (engine, rx) = engine(fake);
+        engine.load_commands("/".into());
+        assert_eq!(
+            recv(&rx),
+            Event::Commands {
+                all: vec!["pull".into()],
+                builtins: vec!["pull".into()]
+            }
+        );
+        engine.load_options("/".into(), "pull".into());
+        assert_eq!(
+            recv(&rx),
+            Event::Options {
+                command: "pull".into(),
+                options: vec!["--pull-opt".into()]
+            }
+        );
+    }
+}
